@@ -1,6 +1,6 @@
 # 模拟软键盘 - 纯 Janet + Win32 原生 FFI
 # 由于 Janet 的 ffi/trampoline 无法作为 WNDPROC 使用，这里采用：
-#   - 系统内置 BUTTON 类创建子窗口
+#   - 系统内置 STATIC 类创建子窗口
 #   - 主窗口 WNDPROC 使用 DefWindowProcW
 #   - 主循环中轮询鼠标状态来检测点击
 
@@ -20,11 +20,12 @@
 (def WS_CLIPSIBLINGS 0x04000000)
 (def WS_BORDER 0x00800000)
 
-# 改用 STATIC 控件，避免 BUTTON 抢焦点
+# 改用 STATIC 控件，避免 BUTTON 抢焦点或发送点击命令。
 (def SS_CENTER 0x00000001)
 (def SS_NOTIFY 0x00000100)
+(def SS_CENTERIMAGE 0x00000200)
 (def STATIC-STYLE
-  (+ WS_CHILD WS_VISIBLE WS_CLIPSIBLINGS WS_BORDER SS_CENTER SS_NOTIFY))
+  (+ WS_CHILD WS_VISIBLE WS_CLIPSIBLINGS WS_BORDER SS_CENTER SS_CENTERIMAGE SS_NOTIFY))
 
 (def MAIN-WINDOW-STYLE
   (+ WS_CAPTION WS_SYSMENU WS_MINIMIZEBOX))
@@ -38,6 +39,23 @@
 # 长按阈值（秒）
 (def LONG-PRESS-THRESHOLD 0.4)
 (def GRIPPER-SIZE 18)
+(def WINDOW-TITLE "SCADA")
+(def DEFAULT-LANGUAGE-CODE "zh_cn")
+(def IME-LABELS
+  {"zh_cn" "输入法"
+   "en_gb" "Input Method"
+   "ja_jp" "入力方式"
+   "ar_eg" "طريقة الإدخال"
+   "az_az" "Daxiletmə üsulu"
+   "bn_bd" "ইনপুট পদ্ধতি"
+   "ru_ru" "Метод ввода"
+   "ca_es" "Mètode d'entrada"
+   "cs_cz" "Metoda vstupu"
+   "da_dk" "Inputmetode"
+   "de_de" "Eingabemethode"
+   "el_gr" "Μέθοδος εισόδου"
+   "es_es" "Método de entrada"
+   "eu_es" "Sarrera metodoa"})
 
 (def GWL_STYLE -16)
 (def SS_SUNKEN 0x00001000)
@@ -231,7 +249,7 @@
                    WS_EX_NOACTIVATE
                    (to-utf16 "STATIC")
                    (to-utf16 "◢")
-                   (+ WS_CHILD WS_VISIBLE WS_CLIPSIBLINGS WS_BORDER SS_CENTER)
+                   (+ WS_CHILD WS_VISIBLE WS_CLIPSIBLINGS WS_BORDER SS_CENTER SS_CENTERIMAGE)
                    x y GRIPPER-SIZE GRIPPER-SIZE
                    parent nil hinstance nil)]
     (when (nil? hwnd)
@@ -285,7 +303,7 @@
    :ime? (or ime? false)
    :shift-label (or shift-label label)})
 
-(def keyboard-rows
+(defn- make-keyboard-rows [ime-label]
   [[(make-key "`" VK_OEM_3 nil nil nil "~")
     (make-key "1" VK_1 nil nil nil "!")
     (make-key "2" VK_2 nil nil nil "@")
@@ -338,11 +356,11 @@
     (make-key "/" VK_OEM_2 nil nil nil "?")
     (make-key "Shift" VK_SHIFT 80 true)]
    [(make-key "Space" VK_SPACE 705)
-    (make-key "输入法" VK_SHIFT 85 false true)]])
+    (make-key ime-label VK_SHIFT 85 false true)]])
 
-(defn- build-layout [hwnd]
+(defn- build-layout [hwnd ime-label]
   (let [buttons @[]]
-    (each [row-idx keys] (pairs keyboard-rows)
+    (each [row-idx keys] (pairs (make-keyboard-rows ime-label))
       (let [y (+ 10 (* row-idx row-height))
             start-x (if (= row-idx 4)
                       10
@@ -413,13 +431,15 @@
         font-height (math/round (* key-height 0.4 scale-y))
         new-font (create-font (max 8 font-height))]
     (each btn buttons
-      (call "SetWindowPos" (btn :hwnd) nil
-            (math/round (* (btn :base-x) scale-x))
-            (math/round (* (btn :base-y) scale-y))
-            (math/round (* (btn :base-w) scale-x))
-            (math/round (* (btn :base-h) scale-y))
-            (+ SWP_NOZORDER SWP_NOACTIVATE))
-      (call "SendMessageW" (btn :hwnd) WM_SETFONT new-font nil))
+      (let [btn-w (math/round (* (btn :base-w) scale-x))
+            btn-h (math/round (* (btn :base-h) scale-y))]
+        (call "SetWindowPos" (btn :hwnd) nil
+              (math/round (* (btn :base-x) scale-x))
+              (math/round (* (btn :base-y) scale-y))
+              btn-w
+              btn-h
+              (+ SWP_NOZORDER SWP_NOACTIVATE))
+        (call "SendMessageW" (btn :hwnd) WM_SETFONT new-font nil)))
     (call "SetWindowPos" gripper nil
           (- new-client-w GRIPPER-SIZE)
           (- new-client-h GRIPPER-SIZE)
@@ -435,7 +455,7 @@
   (var current-font nil)
   (let [msg-buf (buffer/new-filled MSG-BUF-SIZE)
         pt-buf (buffer/new-filled (ffi/size (structs :point)))
-        shift-btns (filter |(= VK_SHIFT ($ :vk)) buttons)
+        shift-btns (filter |($ :toggle?) buttons)
         # 非客户区尺寸，用于把客户区大小换算成完整窗口大小
         win-buf (buffer/new-filled (ffi/size (structs :rect)))
         client-buf (buffer/new-filled (ffi/size (structs :rect)))
@@ -554,16 +574,36 @@
 # -----------------------------------------------------------------------------
 # 入口
 
+(defn- arg-value [args prefix]
+  (when-let [arg (find |(string/has-prefix? prefix $) args)]
+    (string/slice arg (length prefix))))
+
+(defn- normalize-language-code [code]
+  (if (has-key? IME-LABELS code)
+    code
+    DEFAULT-LANGUAGE-CODE))
+
+(defn- language-code [args]
+  (normalize-language-code
+    (or (arg-value args "--code=")
+        (find |(has-key? IME-LABELS $) args)
+        DEFAULT-LANGUAGE-CODE)))
+
+(defn- ime-label-for-code [code]
+  (or (IME-LABELS code)
+      (IME-LABELS DEFAULT-LANGUAGE-CODE)))
+
 (defn main [& args]
   (ensure-ffi!)
-  (let [class-name16 (to-utf16 "JanetSoftKeyboardClass")
-        title16 (to-utf16 "大键盘")
+  (let [ime-label (ime-label-for-code (language-code args))
+        class-name16 (to-utf16 "JanetSoftKeyboardClass")
+        title16 (to-utf16 WINDOW-TITLE)
         _ (register-class! class-name16)
         hwnd (create-main-window class-name16 title16 100 100 850 340)
         client-buf (buffer/new-filled (ffi/size (structs :rect)))
         _ (call "GetClientRect" hwnd client-buf)
         [_ _ base-client-w base-client-h] (ffi/read (structs :rect) client-buf)
-        buttons (build-layout hwnd)
+        buttons (build-layout hwnd ime-label)
         gripper (create-gripper hwnd (- base-client-w GRIPPER-SIZE) (- base-client-h GRIPPER-SIZE))]
     (call "ShowWindow" hwnd SW_SHOWNA)
     (call "UpdateWindow" hwnd)
@@ -574,6 +614,8 @@
     # 清理
     (call "UnregisterClassW" class-name16 (call "GetModuleHandleW" nil))))
 
-# 仅在直接用 janet 运行脚本时执行 main；jpm build/quickbin 时不执行
-(when (not (find |(or (= $ "build") (= $ "quickbin")) (dyn :args)))
+# 仅在直接运行源码时执行 main；jpm build 会 dofile 本文件收集 main，不能在加载阶段启动窗口。
+(when (or (find |(= $ "--run") (dyn :args))
+          (and (first (dyn :args))
+               (string/has-suffix? "softkeyboard.janet" (first (dyn :args)))))
   (main))

@@ -1,5 +1,4 @@
 build/
-*.exe
 *.zip
 *.obj
 *.lib

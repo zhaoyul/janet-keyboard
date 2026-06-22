@@ -9,12 +9,17 @@
 - 数字键 `0-9`
 - QWERTY 字母键 `a-z`
 - `Shift` 键：短按切换大小写，长按切换输入法中/英
+- 右下角输入法按钮：点击切换输入法中/英
 - `Space`、`Backspace`、`Enter`
 - 右下角拖动柄，可按固定宽高比缩放整个键盘
 - 点击按键不抢夺目标窗口焦点
-- 中文界面，窗口标题为 `scada 软键盘`
+- 窗口标题固定为 `SCADA`
+- 支持通过启动参数设置输入法按钮文案语言
 
 ---
+
+如图：
+![键盘](imgs/keyboard.png)
 
 ## 项目结构
 
@@ -44,6 +49,33 @@ scada-keyboard/
 
 如果你已经拿到了 `scada-keyboard.exe`，直接双击运行即可。键盘窗口会置顶显示，打开记事本等输入窗口后点击按键即可输入。
 
+也可以传入语言 code，设置右下角输入法按钮的显示文字：
+
+```batch
+scada-keyboard.exe --code=en_gb
+```
+
+不传参数或传入未支持的 code 时，默认使用中文 `zh_cn`。
+
+### 支持的语言 code
+
+| code | 语言 | 输入法按钮文案 |
+| --- | --- | --- |
+| `zh_cn` | 中文 | 输入法 |
+| `en_gb` | 英文 | Input Method |
+| `ja_jp` | 日文 | 入力方式 |
+| `ar_eg` | 阿拉伯语 | طريقة الإدخال |
+| `az_az` | 阿塞拜疆语 | Daxiletmə üsulu |
+| `bn_bd` | 孟加拉语 | ইনপুট পদ্ধতি |
+| `ru_ru` | 俄罗斯语 | Метод ввода |
+| `ca_es` | 加泰罗尼亚语 | Mètode d'entrada |
+| `cs_cz` | 捷克语 | Metoda vstupu |
+| `da_dk` | 丹麦语 | Inputmetode |
+| `de_de` | 德语 | Eingabemethode |
+| `el_gr` | 希腊语 | Μέθοδος εισόδου |
+| `es_es` | 西班牙语 | Método de entrada |
+| `eu_es` | 巴斯克语 | Sarrera metodoa |
+
 ---
 
 ## 源码运行
@@ -55,6 +87,12 @@ janet softkeyboard.janet
 ```
 
 这会直接启动软键盘窗口。
+
+源码运行也支持相同的语言 code：
+
+```bash
+janet softkeyboard.janet --code=ja_jp
+```
 
 ---
 
@@ -91,9 +129,10 @@ jpm --headerpath="C:\Users\a123\scoop\apps\janet\current\C" --libpath="C:\Users\
 2. 点击目标输入窗口（如记事本、浏览器输入框），使其获得焦点
 3. 点击软键盘上的按键输入字符
 4. 短按 `Shift` 切换大小写
-5. 长按 `Shift`（约 0.4 秒）切换输入法中/英模式
-6. 拖动右下角 `◢` 缩放键盘
-7. 点击窗口右上角 `×` 关闭
+5. 点击右下角输入法按钮切换输入法中/英模式
+6. 长按 `Shift`（约 0.4 秒）也可以切换输入法中/英模式
+7. 拖动右下角 `◢` 缩放键盘
+8. 点击窗口右上角 `×` 关闭
 
 ---
 
@@ -109,7 +148,7 @@ jpm --headerpath="C:\Users\a123\scoop\apps\janet\current\C" --libpath="C:\Users\
 
 - 仅支持 Windows x64
 - 不包含完整的标点符号层
-- 长按 Shift 的输入法切换依赖于当前输入法把 `Shift` 作为中/英切换键
+- 输入法按钮和长按 Shift 的中/英切换都依赖于当前输入法把 `Shift` 作为中/英切换键
 
 ---
 
