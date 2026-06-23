@@ -41,6 +41,9 @@
 (def LONG-PRESS-THRESHOLD 0.4)
 (def GRIPPER-SIZE 18)
 (def WINDOW-TITLE "SCADA")
+(def DEFAULT-WINDOW-RECT [100 100 850 340])
+(def WINDOW-STATE-DIR "scada-keyboard")
+(def WINDOW-STATE-FILE "window.txt")
 (def DEFAULT-LANGUAGE-CODE "zh_cn")
 (def IME-LABELS
   {"zh_cn" "输入法"
@@ -196,6 +199,53 @@
         buf (buffer/new (* 2 count))]
     (call "MultiByteToWideChar" CP_UTF8 0 s -1 buf count)
     buf))
+
+(defn- path-join [parent child]
+  (string parent "\\" child))
+
+(defn- window-state-path []
+  (let [appdata (os/getenv "APPDATA")]
+    (if appdata
+      (path-join (path-join appdata WINDOW-STATE-DIR) WINDOW-STATE-FILE)
+      WINDOW-STATE-FILE)))
+
+(defn- ensure-window-state-dir! []
+  (when-let [appdata (os/getenv "APPDATA")]
+    (let [dir (path-join appdata WINDOW-STATE-DIR)]
+      (when (nil? (os/stat dir))
+        (try
+          (os/mkdir dir)
+          ([err] nil))))))
+
+(defn- valid-window-rect? [rect]
+  (and (= 4 (length rect))
+       (number? (rect 0))
+       (number? (rect 1))
+       (number? (rect 2))
+       (number? (rect 3))
+       (> (rect 2) 0)
+       (> (rect 3) 0)))
+
+(defn- parse-window-rect [text]
+  (let [parts (string/split " " (string/trim text))]
+    (when (= 4 (length parts))
+      (let [rect (map scan-number parts)]
+        (when (valid-window-rect? rect)
+          rect)))))
+
+(defn- load-window-rect []
+  (let [[ok? text] (protect (slurp (window-state-path)))]
+    (or (when ok?
+          (parse-window-rect text))
+        DEFAULT-WINDOW-RECT)))
+
+(defn- save-window-rect [rect]
+  (when (valid-window-rect? rect)
+    (ensure-window-state-dir!)
+    (let [text (string (rect 0) " " (rect 1) " " (rect 2) " " (rect 3))]
+      (try
+        (spit (window-state-path) text)
+        ([err] nil)))))
 
 # -----------------------------------------------------------------------------
 # 窗口类与窗口创建
@@ -464,6 +514,7 @@
 
 (defn- run-loop [hwnd buttons gripper base-client-w base-client-h]
   (var current-font nil)
+  (var last-window-rect nil)
   (let [msg-buf (buffer/new-filled MSG-BUF-SIZE)
         pt-buf (buffer/new-filled (ffi/size (structs :point)))
         shift-btns (filter |($ :toggle?) buttons)
@@ -477,6 +528,7 @@
         nc-w (- (- wr wl) (- cr cl))
         nc-h (- (- wb wt) (- cb ct))
         base-ratio (/ base-client-w base-client-h)]
+    (set last-window-rect [wl wt (- wr wl) (- wb wt)])
     (set current-font (reposition-buttons hwnd buttons gripper base-client-w base-client-h base-client-w base-client-h nil))
     (update-key-labels buttons false)
     (var running true)
@@ -502,6 +554,10 @@
       (when (= 0 (call "IsWindow" hwnd))
         (set running false)
         (break))
+
+      (call "GetWindowRect" hwnd win-buf)
+      (let [[l t r b] (ffi/read (structs :rect) win-buf)]
+        (set last-window-rect [l t (- r l) (- b t)]))
 
       # 鼠标左键轮询
       (let [state (call "GetAsyncKeyState" VK_LBUTTON)
@@ -580,6 +636,7 @@
         (set prev-lbutton down?))
 
       (ev/sleep 0.01))
+    (save-window-rect last-window-rect)
     current-font))
 
 # -----------------------------------------------------------------------------
@@ -609,8 +666,9 @@
   (let [ime-label (ime-label-for-code (language-code args))
         class-name16 (to-utf16 "JanetSoftKeyboardClass")
         title16 (to-utf16 WINDOW-TITLE)
+        [x y w h] (load-window-rect)
         _ (register-class! class-name16)
-        hwnd (create-main-window class-name16 title16 100 100 850 340)
+        hwnd (create-main-window class-name16 title16 x y w h)
         client-buf (buffer/new-filled (ffi/size (structs :rect)))
         _ (call "GetClientRect" hwnd client-buf)
         [_ _ base-client-w base-client-h] (ffi/read (structs :rect) client-buf)

@@ -27,7 +27,7 @@
 scada-keyboard/
 ├── softkeyboard.janet    # 软键盘源代码（Janet + Win32 FFI）
 ├── project.janet         # jpm 项目配置
-├── build-exe.bat         # Windows 编译脚本
+├── build-exe.bat         # 旧编译脚本；当前以 README 的 PowerShell 构建命令为准
 ├── build/                # jpm 构建输出目录
 │   └── scada-keyboard.exe
 ├── scada-keyboard.exe    # 最终可执行文件（从 build/ 复制出来）
@@ -41,7 +41,7 @@ scada-keyboard/
 - Windows 10/11 x64
 - [Janet](https://janet-lang.org/)（已安装并加入 PATH）
 - [jpm](https://github.com/janet-lang/jpm)（通常随 Janet 一起安装）
-- Visual Studio 2022（需要 C++ 桌面开发工作负载，用于链接生成 exe）
+- MinGW-w64 `gcc`（用于最终链接生成 exe）
 
 ---
 
@@ -98,28 +98,61 @@ janet softkeyboard.janet --code=ja_jp
 
 ## 编译成 exe
 
-由于 Windows 下 MSVC 的 `cl.exe` 不在默认 PATH 中，需要先初始化 Visual Studio 编译环境。项目已提供 `build-exe.bat`：
+当前验证可用的构建方式是：
 
-```batch
-cd scada-keyboard
-build-exe.bat
+1. 使用 Janet/JPM 从 `softkeyboard.janet` 生成 `build/scada-keyboard.exe.c`
+2. 使用 MinGW `gcc` 把生成的 C 文件和 Janet runtime 源码一起链接成 exe
+3. 把 `build/scada-keyboard.exe` 复制到项目根目录 `scada-keyboard.exe`
+
+在 PowerShell 中执行：
+
+```powershell
+cd D:\code\scada\janet-keyboard
+
+C:\Users\Administrator\scoop\apps\janet\current\bin\janet.exe -k softkeyboard.janet
+
+$env:PATH='C:\Users\Administrator\scoop\apps\mingw\15.2.0-rt_v13-rev1\bin;C:\Users\Administrator\scoop\apps\janet\current\bin;' + $env:PATH
+C:\Users\Administrator\scoop\apps\janet\current\bin\janet.exe -m C:\Users\Administrator\scoop\apps\janet\1.40.1\lib\janet -e '(import jpm/cli) (cli/main "jpm" "--cc=gcc" "--cc-link=gcc" "--c++=g++" "--c++-link=g++" "--cflags=-std=c99" "--cppflags=-std=c++11" "--lflags=" "--is-msvc=false" "--headerpath=C:/Users/Administrator/scoop/apps/janet/current/C" "--libpath=C:/Users/Administrator/scoop/apps/janet/current/C" "build")'
+
+$env:PATH='C:\Users\Administrator\scoop\apps\mingw\15.2.0-rt_v13-rev1\bin;' + $env:PATH
+gcc -O2 -I C:\Users\Administrator\scoop\apps\janet\current\C build\scada-keyboard.exe.c C:\Users\Administrator\scoop\apps\janet\current\C\janet.c -o build\scada-keyboard.exe -lws2_32 -lmswsock -ladvapi32 -lpsapi
+
+Copy-Item -Path .\build\scada-keyboard.exe -Destination .\scada-keyboard.exe -Force
 ```
 
-编译完成后，可执行文件会生成在：
+> 注意：上面的 `C:\Users\Administrator\scoop\apps\...` 是当前机器上的 Janet 和 MinGW 安装路径。如果换机器构建，需要按实际安装路径调整。
+
+执行完成后，可执行文件会生成在：
 
 - `build/scada-keyboard.exe`
-- 同时复制一份到 `scada-keyboard.exe`
+- `scada-keyboard.exe`
 
-### 手动编译
+### 关于 JPM 链接报错
 
-如果你已经打开了 **x64 Native Tools Command Prompt for VS 2022**，可以执行：
+当前环境中，JPM 的 `build` 命令可以成功生成 `build/scada-keyboard.exe.c`，但它后续自动链接阶段会因为 Janet 自带的 `libjanet.lib` 和 MinGW 链接器不兼容而失败，例如出现 `undefined reference`。
 
-```batch
-cd scada-keyboard
-jpm --headerpath="C:\Users\a123\scoop\apps\janet\current\C" --libpath="C:\Users\a123\scoop\apps\janet\current\C" --is-msvc build
+这是预期现象；只要已经看到：
+
+```text
+generating executable c source build/scada-keyboard.exe.c from softkeyboard.janet
 ```
 
-> 注意：根据你的 Janet 安装路径，可能需要调整 `headerpath` 和 `libpath`。它们应指向包含 `janet.h` 和 `libjanet.lib` 的目录。
+就可以继续执行后面的 `gcc ... janet.c ...` 手动链接命令。
+
+### 验证 exe
+
+可以用 `objdump` 确认可执行文件格式：
+
+```powershell
+cmd /d /c "C:\Users\Administrator\scoop\apps\mingw\15.2.0-rt_v13-rev1\bin\objdump.exe -f scada-keyboard.exe"
+```
+
+输出中应包含：
+
+```text
+file format pei-x86-64
+architecture: i386:x86-64
+```
 
 ---
 
