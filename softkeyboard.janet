@@ -10,6 +10,7 @@
 (def CP_UTF8 65001)
 
 (def KEYEVENTF_KEYUP 0x0002)
+(def KEYEVENTF_SCANCODE 0x0008)
 (def WM_SETFONT 0x0030)
 
 (def WS_CAPTION 0x00C00000)
@@ -35,15 +36,22 @@
 (def WS_EX_TOOLWINDOW 0x00000080)
 (def WS_EX_STATICEDGE 0x00020000)
 
+(def SW_SHOWNORMAL 1)
 (def SW_SHOWNA 8)
 
 # 长按阈值（秒）
 (def LONG-PRESS-THRESHOLD 0.4)
+(def CLICK-FEEDBACK-SECONDS 0.12)
+(def CLICK-FEEDBACK-OFFSET 3)
+(def WINDOW-SAVE-INTERVAL 0.5)
 (def GRIPPER-SIZE 18)
 (def WINDOW-TITLE "SCADA")
 (def DEFAULT-WINDOW-RECT [100 100 850 340])
 (def WINDOW-STATE-DIR "scada-keyboard")
 (def WINDOW-STATE-FILE "window.txt")
+(def REQUEST-FILE "request.txt")
+(def LOG-FILE "scada-keyboard.log")
+(def SINGLE-INSTANCE-MUTEX "Local\\SCADAKeyboardSingleInstance")
 (def DEFAULT-LANGUAGE-CODE "zh_cn")
 (def IME-LABELS
   {"zh_cn" "输入法"
@@ -72,6 +80,7 @@
 (def VK_LBUTTON 0x01)
 (def VK_ESCAPE 0x1B)
 (def VK_SHIFT 0x10)
+(def VK_LSHIFT 0xA0)
 (def VK_BACK 0x08)
 (def VK_RETURN 0x0D)
 (def VK_SPACE 0x20)
@@ -101,8 +110,18 @@
 (def VK_OEM_2 0xBF)   # / ?
 
 (def HWND_TOPMOST -1)
+(def HWND_NOTOPMOST -2)
 
 (def PM_REMOVE 1)
+
+(def ERROR_ALREADY_EXISTS 183)
+(def SM_XVIRTUALSCREEN 76)
+(def SM_YVIRTUALSCREEN 77)
+(def SM_CXVIRTUALSCREEN 78)
+(def SM_CYVIRTUALSCREEN 79)
+(def MAPVK_VK_TO_VSC 0)
+(def INPUT_KEYBOARD 1)
+(def INPUT-BUF-SIZE 40)
 
 (def IDI_APPLICATION 32512)
 (def IDC_ARROW 32512)
@@ -140,6 +159,8 @@
     (bind! kernel32 "GetModuleHandleW" :ptr :ptr)
     (bind! kernel32 "MultiByteToWideChar" :int32 :uint32 :uint32 :ptr :int32 :ptr :int32)
     (bind! kernel32 "GetLastError" :uint32)
+    (bind! kernel32 "CreateMutexW" :ptr :ptr :int32 :ptr)
+    (bind! kernel32 "CloseHandle" :int32 :ptr)
 
     # user32
     (bind! user32 "RegisterClassExW" :uint16 :ptr)
@@ -156,15 +177,18 @@
     (bind! user32 "GetCursorPos" :int32 :ptr)
     (bind! user32 "GetWindowRect" :int32 :ptr :ptr)
     (bind! user32 "GetClientRect" :int32 :ptr :ptr)
+    (bind! user32 "ScreenToClient" :int32 :ptr :ptr)
     (bind! user32 "SetWindowTextW" :int32 :ptr :ptr)
     (bind! user32 "IsWindow" :int32 :ptr)
-    (bind! user32 "SetWindowPos" :int32 :ptr :ptr :int32 :int32 :int32 :int32 :uint32)
+    (bind! user32 "SetWindowPos" :int32 :ptr :ssize :int32 :int32 :int32 :int32 :uint32)
     (bind! user32 "GetWindowLongPtrW" :ssize :ptr :int32)
     (bind! user32 "SetWindowLongPtrW" :ssize :ptr :int32 :ssize)
     (bind! user32 "SetForegroundWindow" :int32 :ptr)
     (bind! user32 "SendMessageW" :ptr :ptr :uint32 :ptr :ptr)
     (bind! user32 "InvalidateRect" :int32 :ptr :ptr :int32)
     (bind! user32 "PostQuitMessage" :void :int32)
+    (bind! user32 "SendInput" :uint32 :uint32 :ptr :int32)
+    (bind! user32 "MapVirtualKeyW" :uint32 :uint32 :uint32)
 
     # gdi32
     (bind! gdi32 "CreateFontW" :ptr :int32 :int32 :int32 :int32 :int32 :uint32 :uint32 :uint32 :uint32 :uint32 :uint32 :uint32 :uint32 :ptr)
@@ -174,6 +198,9 @@
     (bind! user32 "LoadCursorW" :ptr :ptr :ptr)
     (bind! user32 "GetSysColorBrush" :ptr :int32)
     (bind! user32 "GetForegroundWindow" :ptr)
+    (bind! user32 "GetWindowThreadProcessId" :uint32 :ptr :ptr)
+    (bind! user32 "GetKeyboardLayout" :ptr :uint32)
+    (bind! user32 "GetSystemMetrics" :int32 :int32)
 
     # 数据结构定义
     (put structs :wndclassexw
@@ -208,6 +235,18 @@
     (if appdata
       (path-join (path-join appdata WINDOW-STATE-DIR) WINDOW-STATE-FILE)
       WINDOW-STATE-FILE)))
+
+(defn- request-path []
+  (let [appdata (os/getenv "APPDATA")]
+    (if appdata
+      (path-join (path-join appdata WINDOW-STATE-DIR) REQUEST-FILE)
+      REQUEST-FILE)))
+
+(defn- log-path []
+  (let [appdata (os/getenv "APPDATA")]
+    (if appdata
+      (path-join (path-join appdata WINDOW-STATE-DIR) LOG-FILE)
+      LOG-FILE)))
 
 (defn- ensure-window-state-dir! []
   (when-let [appdata (os/getenv "APPDATA")]
@@ -247,6 +286,72 @@
         (spit (window-state-path) text)
         ([err] nil)))))
 
+(defn- same-window-rect? [a b]
+  (and a b
+       (= (a 0) (b 0))
+       (= (a 1) (b 1))
+       (= (a 2) (b 2))
+       (= (a 3) (b 3))))
+
+(defn- log-line [msg]
+  (ensure-window-state-dir!)
+  (try
+    (let [f (file/open (log-path) :a)]
+      (file/write f (string (os/time) " " msg "\n"))
+      (file/close f))
+    ([err] nil)))
+
+(defn- virtual-screen-rect []
+  (let [x (call "GetSystemMetrics" SM_XVIRTUALSCREEN)
+        y (call "GetSystemMetrics" SM_YVIRTUALSCREEN)
+        w (call "GetSystemMetrics" SM_CXVIRTUALSCREEN)
+        h (call "GetSystemMetrics" SM_CYVIRTUALSCREEN)]
+    [x y (+ x w) (+ y h)]))
+
+(defn- rect-intersects? [rect bounds]
+  (let [[x y w h] rect
+        [l t r b] bounds]
+    (and (< x r)
+         (> (+ x w) l)
+         (< y b)
+         (> (+ y h) t))))
+
+(defn- clamp [value low high]
+  (min (max value low) high))
+
+(defn- safe-window-rect [rect]
+  (let [[l t r b] (virtual-screen-rect)
+        safe (if (rect-intersects? rect [l t r b])
+               rect
+               DEFAULT-WINDOW-RECT)
+        [x y w h] safe
+        max-x (max l (- r w))
+        max-y (max t (- b h))]
+    [(clamp x l max-x) (clamp y t max-y) w h]))
+
+(defn- load-safe-window-rect []
+  (safe-window-rect (load-window-rect)))
+
+(defn- write-launch-request [code]
+  (ensure-window-state-dir!)
+  (let [[ok? _] (protect (spit (request-path) (string (os/time) "\n" code)))]
+    ok?))
+
+(defn- read-launch-request []
+  (let [[ok? text] (protect (slurp (request-path)))]
+    (when ok?
+      (let [trimmed (string/trim text)
+            parts (string/split "\n" trimmed)]
+        {:raw trimmed
+         :code (when (> (length parts) 1)
+                 (string/trim (parts 1)))}))))
+
+(defn- acquire-single-instance []
+  (let [handle (call "CreateMutexW" nil 1 (to-utf16 SINGLE-INSTANCE-MUTEX))
+        err (call "GetLastError")]
+    {:handle handle
+     :already-running? (= err ERROR_ALREADY_EXISTS)}))
+
 # -----------------------------------------------------------------------------
 # 窗口类与窗口创建
 
@@ -281,6 +386,12 @@
       (error (string "CreateWindowExW failed, error=" (call "GetLastError"))))
     hwnd))
 
+(defn- show-and-raise-window [hwnd]
+  (call "ShowWindow" hwnd SW_SHOWNORMAL)
+  (call "SetForegroundWindow" hwnd)
+  (call "SetWindowPos" hwnd HWND_TOPMOST 0 0 0 0
+        (+ SWP_NOMOVE SWP_NOSIZE SWP_NOACTIVATE)))
+
 (defn- create-key [parent label16 x y w h]
   (let [hinstance (call "GetModuleHandleW" nil)
         hwnd (call "CreateWindowExW"
@@ -313,6 +424,42 @@
 (defn- key-event [vk up?]
   (call "keybd_event" vk 0 (if up? KEYEVENTF_KEYUP 0) nil))
 
+(defn- log-ime-target []
+  (let [foreground (call "GetForegroundWindow")
+        thread-id (if foreground
+                    (call "GetWindowThreadProcessId" foreground nil)
+                    0)
+        layout (call "GetKeyboardLayout" thread-id)]
+    (log-line (string "[ime] foreground=" foreground
+                      " thread=" thread-id
+                      " layout=" layout))))
+
+(defn- write-keyboard-input! [buf offset scan flags]
+  (ffi/write :uint32 INPUT_KEYBOARD buf offset)
+  (ffi/write :uint16 0 buf (+ offset 8))
+  (ffi/write :uint16 scan buf (+ offset 10))
+  (ffi/write :uint32 flags buf (+ offset 12))
+  (ffi/write :uint32 0 buf (+ offset 16)))
+
+(defn- sendinput-left-shift []
+  (let [scan (call "MapVirtualKeyW" VK_LSHIFT MAPVK_VK_TO_VSC)]
+    (if (= scan 0)
+      (do
+        (log-line (string "[ime] MapVirtualKeyW VK_LSHIFT failed error="
+                          (call "GetLastError")))
+        false)
+      (let [buf (buffer/new-filled (* INPUT-BUF-SIZE 2))]
+        (write-keyboard-input! buf 0 scan KEYEVENTF_SCANCODE)
+        (write-keyboard-input! buf INPUT-BUF-SIZE scan (+ KEYEVENTF_SCANCODE KEYEVENTF_KEYUP))
+        (let [sent (call "SendInput" 2 buf INPUT-BUF-SIZE)
+              err (call "GetLastError")
+              ok? (= sent 2)]
+          (log-line (string "[ime] SendInput left-shift scan=" scan
+                            " sent=" sent
+                            " error=" err
+                            " ok=" (if ok? "1" "0")))
+          ok?)))))
+
 (defn- send-key [vk shift?]
   (when shift?
     (key-event VK_SHIFT false))
@@ -322,10 +469,13 @@
     (key-event VK_SHIFT true)))
 
 (defn- toggle-ime
-  "发送一个单独的 Shift 键事件，供输入法切换中/英模式。"
+  "发送一个单独的左 Shift 键事件，供输入法切换中/英模式。"
   []
-  (key-event VK_SHIFT false)
-  (key-event VK_SHIFT true))
+  (log-ime-target)
+  (when (not (sendinput-left-shift))
+    (log-line "[ime] SendInput failed, fallback keybd_event shift")
+    (key-event VK_SHIFT false)
+    (key-event VK_SHIFT true)))
 
 # -----------------------------------------------------------------------------
 # 键盘布局
@@ -468,20 +618,61 @@
 (defn- letter? [vk]
   (and (>= vk VK_A) (<= vk VK_Z)))
 
+(defn- arg-value [args prefix]
+  (when-let [arg (find |(string/has-prefix? prefix $) args)]
+    (string/slice arg (length prefix))))
+
+(defn- normalize-language-code [code]
+  (if (has-key? IME-LABELS code)
+    code
+    DEFAULT-LANGUAGE-CODE))
+
+(defn- language-code [args]
+  (normalize-language-code
+    (or (arg-value args "--code=")
+        (find |(has-key? IME-LABELS $) args)
+        DEFAULT-LANGUAGE-CODE)))
+
+(defn- ime-label-for-code [code]
+  (or (IME-LABELS code)
+      (IME-LABELS DEFAULT-LANGUAGE-CODE)))
+
 (defn- update-key-labels [buttons shift?]
   (each btn buttons
     (when (not (or (btn :toggle?) (btn :ime?)))
       (call "SetWindowTextW" (btn :hwnd)
             (to-utf16 (if shift? (btn :shift-label) (btn :label)))))))
 
-(defn- set-key-pressed [btn pressed?]
-  (let [style (call "GetWindowLongPtrW" (btn :hwnd) GWL_STYLE)
-        new-style (if pressed?
-                    (bor style SS_SUNKEN)
-                    (band style (bnot SS_SUNKEN)))]
-    (call "SetWindowLongPtrW" (btn :hwnd) GWL_STYLE new-style)
-    (call "SetWindowPos" (btn :hwnd) nil 0 0 0 0
-          (+ SWP_NOMOVE SWP_NOSIZE SWP_NOACTIVATE SWP_FRAMECHANGED SWP_NOZORDER))))
+(defn- update-ime-label [buttons code]
+  (let [label (ime-label-for-code code)]
+    (each btn buttons
+      (when (btn :ime?)
+        (call "SetWindowTextW" (btn :hwnd) (to-utf16 label))))))
+
+(defn- child-window-rect [parent child]
+  (let [rect-buf (buffer/new-filled (ffi/size (structs :rect)))]
+    (call "GetWindowRect" child rect-buf)
+    (let [[l t r b] (ffi/read (structs :rect) rect-buf)
+          pt-buf (ffi/write (structs :point) [l t])]
+      (call "ScreenToClient" parent pt-buf)
+      (let [[x y] (ffi/read (structs :point) pt-buf)]
+        [x y (- r l) (- b t)]))))
+
+(defn- move-key-to-rect [btn rect]
+  (let [[x y w h] rect]
+    (call "SetWindowPos" (btn :hwnd) 0 x y w h
+          (+ SWP_NOZORDER SWP_NOACTIVATE))))
+
+(defn- set-key-pressed [parent btn pressed? &opt restore-rect]
+  (let [rect (or restore-rect (child-window-rect parent (btn :hwnd)))]
+    (let [[x y w h] rect
+          target (if pressed?
+                   [(+ x CLICK-FEEDBACK-OFFSET) (+ y CLICK-FEEDBACK-OFFSET) w h]
+                   rect)]
+      (move-key-to-rect btn target))
+    (call "InvalidateRect" (btn :hwnd) nil 1)
+    (call "UpdateWindow" (btn :hwnd))
+    (if pressed? rect restore-rect)))
 
 (defn- create-font [height]
   (call "CreateFontW" height 0 0 0 400 0 0 0 0 0 0 0 0 nil))
@@ -494,14 +685,14 @@
     (each btn buttons
       (let [btn-w (math/round (* (btn :base-w) scale-x))
             btn-h (math/round (* (btn :base-h) scale-y))]
-        (call "SetWindowPos" (btn :hwnd) nil
+        (call "SetWindowPos" (btn :hwnd) 0
               (math/round (* (btn :base-x) scale-x))
               (math/round (* (btn :base-y) scale-y))
               btn-w
               btn-h
               (+ SWP_NOZORDER SWP_NOACTIVATE))
         (call "SendMessageW" (btn :hwnd) WM_SETFONT new-font nil)))
-    (call "SetWindowPos" gripper nil
+    (call "SetWindowPos" gripper 0
           (- new-client-w GRIPPER-SIZE)
           (- new-client-h GRIPPER-SIZE)
           GRIPPER-SIZE GRIPPER-SIZE
@@ -512,9 +703,14 @@
     (call "InvalidateRect" hwnd nil 1)
     new-font))
 
-(defn- run-loop [hwnd buttons gripper base-client-w base-client-h]
+(defn- run-loop [hwnd buttons gripper base-client-w base-client-h initial-code]
   (var current-font nil)
   (var last-window-rect nil)
+  (var last-saved-window-rect nil)
+  (var last-window-save-at 0)
+  (var current-code initial-code)
+  (var last-launch-request nil)
+  (var last-launch-request-check 0)
   (let [msg-buf (buffer/new-filled MSG-BUF-SIZE)
         pt-buf (buffer/new-filled (ffi/size (structs :point)))
         shift-btns (filter |($ :toggle?) buttons)
@@ -529,6 +725,8 @@
         nc-h (- (- wb wt) (- cb ct))
         base-ratio (/ base-client-w base-client-h)]
     (set last-window-rect [wl wt (- wr wl) (- wb wt)])
+    (set last-saved-window-rect last-window-rect)
+    (save-window-rect last-window-rect)
     (set current-font (reposition-buttons hwnd buttons gripper base-client-w base-client-h base-client-w base-client-h nil))
     (update-key-labels buttons false)
     (var running true)
@@ -536,6 +734,9 @@
     (var shift? false)
     (var pressed-btn nil)
     (var pressed-at 0)
+    (var feedback-btn nil)
+    (var feedback-restore-rect nil)
+    (var feedback-release-at 0)
     (var dragging-gripper false)
     (var drag-start-x 0)
     (var drag-start-y 0)
@@ -555,9 +756,30 @@
         (set running false)
         (break))
 
+      (let [now (os/clock)]
+        (when (>= (- now last-launch-request-check) 0.05)
+          (set last-launch-request-check now)
+          (when-let [request (read-launch-request)]
+            (let [raw (request :raw)]
+              (when (and (> (length raw) 0)
+                         (not= raw last-launch-request))
+                (set last-launch-request raw)
+                (let [next-code (normalize-language-code
+                                  (or (request :code) DEFAULT-LANGUAGE-CODE))]
+                  (when (not= next-code current-code)
+                    (set current-code next-code)
+                    (update-ime-label buttons current-code))
+                  (show-and-raise-window hwnd)))))))
+
       (call "GetWindowRect" hwnd win-buf)
       (let [[l t r b] (ffi/read (structs :rect) win-buf)]
-        (set last-window-rect [l t (- r l) (- b t)]))
+        (set last-window-rect [l t (- r l) (- b t)])
+        (let [now (os/clock)]
+          (when (and (not (same-window-rect? last-window-rect last-saved-window-rect))
+                     (>= (- now last-window-save-at) WINDOW-SAVE-INTERVAL))
+            (save-window-rect last-window-rect)
+            (set last-saved-window-rect last-window-rect)
+            (set last-window-save-at now))))
 
       # 鼠标左键轮询
       (let [state (call "GetAsyncKeyState" VK_LBUTTON)
@@ -581,11 +803,16 @@
 
               hit
               (do
+                (when feedback-btn
+                  (set-key-pressed hwnd feedback-btn false feedback-restore-rect)
+                  (set feedback-btn nil)
+                  (set feedback-restore-rect nil))
                 (print "点击: " (hit :label))
                 (flush)
                 (set pressed-btn hit)
                 (set pressed-at (os/clock))
-                (set-key-pressed hit true)
+                (set feedback-btn nil)
+                (set feedback-restore-rect (set-key-pressed hwnd hit true))
                 # 输入法按钮直接切换输入法；普通按键直接发送；Shift 的长/短按在松开时判断
                 (cond
                   (hit :ime?)
@@ -613,14 +840,15 @@
                   [client-w (math/round (/ client-w base-ratio))])
                 final-w (+ final-client-w nc-w)
                 final-h (+ final-client-h nc-h)]
-            (call "SetWindowPos" hwnd nil 0 0 final-w final-h
+            (call "SetWindowPos" hwnd 0 0 0 final-w final-h
                   (+ SWP_NOMOVE SWP_NOZORDER SWP_NOACTIVATE))
             (set current-font (reposition-buttons hwnd buttons gripper base-client-w base-client-h final-client-w final-client-h current-font))))
         (when (and (not down?) prev-lbutton)
           # 刚松开
           (set dragging-gripper false)
           (when pressed-btn
-            (set-key-pressed pressed-btn false)
+            (set feedback-btn pressed-btn)
+            (set feedback-release-at (+ (os/clock) CLICK-FEEDBACK-SECONDS))
             (when (pressed-btn :toggle?)
               (let [duration (- (os/clock) pressed-at)]
                 (if (>= duration LONG-PRESS-THRESHOLD)
@@ -635,6 +863,11 @@
             (set pressed-btn nil)))
         (set prev-lbutton down?))
 
+      (when (and feedback-btn (>= (os/clock) feedback-release-at))
+        (set-key-pressed hwnd feedback-btn false feedback-restore-rect)
+        (set feedback-btn nil)
+        (set feedback-restore-rect nil))
+
       (ev/sleep 0.01))
     (save-window-rect last-window-rect)
     current-font))
@@ -642,46 +875,39 @@
 # -----------------------------------------------------------------------------
 # 入口
 
-(defn- arg-value [args prefix]
-  (when-let [arg (find |(string/has-prefix? prefix $) args)]
-    (string/slice arg (length prefix))))
-
-(defn- normalize-language-code [code]
-  (if (has-key? IME-LABELS code)
-    code
-    DEFAULT-LANGUAGE-CODE))
-
-(defn- language-code [args]
-  (normalize-language-code
-    (or (arg-value args "--code=")
-        (find |(has-key? IME-LABELS $) args)
-        DEFAULT-LANGUAGE-CODE)))
-
-(defn- ime-label-for-code [code]
-  (or (IME-LABELS code)
-      (IME-LABELS DEFAULT-LANGUAGE-CODE)))
-
 (defn main [& args]
   (ensure-ffi!)
-  (let [ime-label (ime-label-for-code (language-code args))
-        class-name16 (to-utf16 "JanetSoftKeyboardClass")
-        title16 (to-utf16 WINDOW-TITLE)
-        [x y w h] (load-window-rect)
-        _ (register-class! class-name16)
-        hwnd (create-main-window class-name16 title16 x y w h)
-        client-buf (buffer/new-filled (ffi/size (structs :rect)))
-        _ (call "GetClientRect" hwnd client-buf)
-        [_ _ base-client-w base-client-h] (ffi/read (structs :rect) client-buf)
-        buttons (build-layout hwnd ime-label)
-        gripper (create-gripper hwnd (- base-client-w GRIPPER-SIZE) (- base-client-h GRIPPER-SIZE))]
-    (call "ShowWindow" hwnd SW_SHOWNA)
-    (call "UpdateWindow" hwnd)
-    (print "软键盘已启动。点击按键发送输入，拖动右下角调整大小，关闭窗口退出。")
-    (let [final-font (run-loop hwnd buttons gripper base-client-w base-client-h)]
-      (when (not (nil? final-font))
-        (call "DeleteObject" final-font)))
-    # 清理
-    (call "UnregisterClassW" class-name16 (call "GetModuleHandleW" nil))))
+  (let [code (language-code args)
+        instance (acquire-single-instance)]
+    (if (instance :already-running?)
+      (do
+        (write-launch-request code)
+        (when (instance :handle)
+          (call "CloseHandle" (instance :handle)))
+        (print "软键盘已在运行，已发送唤起请求。"))
+      (do
+        (write-launch-request code)
+        (let [ime-label (ime-label-for-code code)
+              class-name16 (to-utf16 "JanetSoftKeyboardClass")
+              title16 (to-utf16 WINDOW-TITLE)
+              [x y w h] (load-safe-window-rect)
+              _ (register-class! class-name16)
+              hwnd (create-main-window class-name16 title16 x y w h)
+              client-buf (buffer/new-filled (ffi/size (structs :rect)))
+              _ (call "GetClientRect" hwnd client-buf)
+              [_ _ base-client-w base-client-h] (ffi/read (structs :rect) client-buf)
+              buttons (build-layout hwnd ime-label)
+              gripper (create-gripper hwnd (- base-client-w GRIPPER-SIZE) (- base-client-h GRIPPER-SIZE))]
+          (show-and-raise-window hwnd)
+          (call "UpdateWindow" hwnd)
+          (print "软键盘已启动。点击按键发送输入，拖动右下角调整大小，关闭窗口退出。")
+          (let [final-font (run-loop hwnd buttons gripper base-client-w base-client-h code)]
+            (when (not (nil? final-font))
+              (call "DeleteObject" final-font)))
+          # 清理
+          (call "UnregisterClassW" class-name16 (call "GetModuleHandleW" nil)))
+      (when (instance :handle)
+        (call "CloseHandle" (instance :handle)))))))
 
 # 仅在直接运行源码时执行 main；jpm build 会 dofile 本文件收集 main，不能在加载阶段启动窗口。
 (when (or (find |(= $ "--run") (dyn :args))
